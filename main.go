@@ -151,6 +151,9 @@ func runServer(sockPath, pidPath string) {
 	// Setup FUSE mount
 	mnt := *mountPath
 	if mnt == "" {
+		mnt = os.Getenv("DENOTE_9MOUNT")
+	}
+	if mnt == "" {
 		mnt = filepath.Join(os.Getenv("HOME"), "mnt", "denote")
 	}
 	var fuseCmd *exec.Cmd
