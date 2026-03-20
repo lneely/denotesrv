@@ -994,7 +994,7 @@ func (s *server) getFileContent(path string) string {
 	return ""
 }
 
-// readBody reads the file at path and returns content after frontmatter
+// readBody reads the file content at path
 func (s *server) readBody(path string) string {
 	if path == "" {
 		return ""
@@ -1003,33 +1003,15 @@ func (s *server) readBody(path string) string {
 	if err != nil {
 		return ""
 	}
-	content := string(data)
-	// Skip frontmatter (between --- markers)
-	if strings.HasPrefix(content, "---\n") {
-		if end := strings.Index(content[4:], "\n---\n"); end != -1 {
-			return content[4+end+5:]
-		}
-	}
-	return content
+	return string(data)
 }
 
-// writeBody writes content to file, preserving frontmatter
+// writeBody writes content to file
 func (s *server) writeBody(path, body string) error {
 	if path == "" {
 		return fmt.Errorf("no path")
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	content := string(data)
-	var frontmatter string
-	if strings.HasPrefix(content, "---\n") {
-		if end := strings.Index(content[4:], "\n---\n"); end != -1 {
-			frontmatter = content[:4+end+5]
-		}
-	}
-	return os.WriteFile(path, []byte(frontmatter+body), 0644)
+	return os.WriteFile(path, []byte(body), 0644)
 }
 
 func errorFcall(fc *plan9.Fcall, msg string) *plan9.Fcall {
