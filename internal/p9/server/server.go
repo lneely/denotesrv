@@ -99,10 +99,11 @@ type connState struct {
 }
 
 type fid struct {
-	qid    plan9.Qid
-	path   string
-	offset int64
-	mode   uint8
+	qid      plan9.Qid
+	path     string
+	offset   int64
+	mode     uint8
+	writeBuf []byte // accumulates Twrite chunks, dispatched on Tclunk
 }
 
 var srv *server
@@ -525,17 +526,38 @@ func (s *server) read(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 
 func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
 	f, ok := cs.fids[fc.Fid]
 	if !ok {
+		cs.mu.Unlock()
 		return errorFcall(fc, "fid not found")
 	}
 
 	// Check if opened for writing
 	if f.mode&plan9.OWRITE == 0 && f.mode&plan9.ORDWR == 0 {
+		cs.mu.Unlock()
 		return errorFcall(fc, "file not open for writing")
 	}
+
+	// Accumulate data into the per-fid write buffer at the given offset.
+	// The 9P client splits writes larger than msize into multiple Twrite messages
+	// with increasing offsets; we reassemble here and dispatch on Tclunk.
+	end := int(fc.Offset) + len(fc.Data)
+	if end > len(f.writeBuf) {
+		grown := make([]byte, end)
+		copy(grown, f.writeBuf)
+		f.writeBuf = grown
+	}
+	copy(f.writeBuf[fc.Offset:], fc.Data)
+	cs.mu.Unlock()
+
+	return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(fc.Data))}
+}
+
+// dispatchWrite processes the fully-assembled write payload for a given path.
+// Called from Tclunk after all Twrite chunks have been accumulated.
+func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
+	fc := &plan9.Fcall{Tag: tag, Data: f.writeBuf}
+	input := strings.TrimSpace(string(f.writeBuf))
 
 	// Handle writes to /ctl
 	if f.path == "/ctl" {
@@ -544,10 +566,7 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 
 	// Handle writes to /new
 	if f.path == "/new" {
-		input := strings.TrimSpace(string(fc.Data))
-
 		// Parse: 'Title' ==signature tag1,tag2,...
-		// Extract title (must be single-quoted)
 		if !strings.HasPrefix(input, "'") {
 			return errorFcall(fc, "title must be single-quoted")
 		}
@@ -562,28 +581,22 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 			return errorFcall(fc, "title cannot be empty")
 		}
 
-		// Extract signature and tags (everything after closing quote)
 		remainder := strings.TrimSpace(input[closeQuote+2:])
 		var signature string
 		var tags []string
 
 		if remainder != "" {
-			// Check if signature is present (starts with ==)
 			if strings.HasPrefix(remainder, "==") {
-				// Find end of signature (space before tags)
 				spaceIdx := strings.Index(remainder, " ")
 				if spaceIdx == -1 {
-					// No tags, just signature
-					signature = remainder[2:] // Skip ==
+					signature = remainder[2:]
 				} else {
-					signature = remainder[2:spaceIdx] // Skip ==
+					signature = remainder[2:spaceIdx]
 					remainder = strings.TrimSpace(remainder[spaceIdx+1:])
 				}
 			}
 
-			// Extract tags if present
 			if remainder != "" && !strings.HasPrefix(remainder, "==") {
-				// Validate tags
 				tagPattern := regexp.MustCompile(`^([\p{Ll}\p{Nd}]+,)*[\p{Ll}\p{Nd}]+$`)
 				if !tagPattern.MatchString(remainder) {
 					return errorFcall(fc, "tags must be comma-delimited lowercase unicode words (no spaces)")
@@ -592,34 +605,24 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 			}
 		}
 
-		// Generate timestamp identifier
 		identifier := time.Now().Format("20060102T150405")
-
-		// Create metadata entry with temporary path
-		// (actual file will be created by denote package event handler)
 		meta := &metadata.Metadata{
 			Identifier: identifier,
 			Signature:  signature,
 			Title:      title,
 			Tags:       tags,
-			Path:       "", // Will be set when file is created
+			Path:       "",
 		}
 
-		// Add to in-memory state
 		s.mu.Lock()
 		s.notes = append(s.notes, meta)
 		s.mu.Unlock()
 
-		// Call new note callback
 		if s.callbacks.OnNew != nil {
-			go s.callbacks.OnNew(identifier) // async to not block write
+			go s.callbacks.OnNew(identifier)
 		}
 
-		return &plan9.Fcall{
-			Type:  plan9.Rwrite,
-			Tag:   fc.Tag,
-			Count: uint32(len(fc.Data)),
-		}
+		return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(f.writeBuf))}
 	}
 
 	// Extract note identifier and field name from path
@@ -636,16 +639,11 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 		return errorFcall(fc, err.Error())
 	}
 
-	// Update the field in memory only
-	value := strings.TrimSpace(string(fc.Data))
-
 	switch fieldName {
 	case "path":
-		note.Path = value
-		// Don't emit 'r' - path is metadata only, doesn't trigger renames
+		note.Path = input
 	case "title":
-		note.Title = value
-		// Call update and rename callbacks synchronously
+		note.Title = input
 		if s.callbacks.OnUpdate != nil {
 			s.callbacks.OnUpdate(noteID)
 		}
@@ -653,16 +651,15 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 			s.callbacks.OnRename(noteID)
 		}
 	case "keywords":
-		if value == "" {
+		if input == "" {
 			note.Tags = []string{}
 		} else {
-			tags := strings.Split(value, ",")
+			tags := strings.Split(input, ",")
 			for i := range tags {
 				tags[i] = strings.TrimSpace(tags[i])
 			}
 			note.Tags = tags
 		}
-		// Call update and rename callbacks synchronously
 		if s.callbacks.OnUpdate != nil {
 			s.callbacks.OnUpdate(noteID)
 		}
@@ -670,8 +667,7 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 			s.callbacks.OnRename(noteID)
 		}
 	case "signature":
-		note.Signature = value
-		// Call update and rename callbacks synchronously
+		note.Signature = input
 		if s.callbacks.OnUpdate != nil {
 			s.callbacks.OnUpdate(noteID)
 		}
@@ -679,15 +675,11 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 			s.callbacks.OnRename(noteID)
 		}
 	case "ctl":
-		// Handle control commands
-		switch value {
+		switch input {
 		case "d":
-			// Call delete callback BEFORE removing metadata
 			if s.callbacks.OnDelete != nil {
 				s.callbacks.OnDelete(noteID)
 			}
-
-			// Remove from in-memory state
 			s.mu.Lock()
 			for i, n := range s.notes {
 				if n.Identifier == noteID {
@@ -695,7 +687,6 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 					break
 				}
 			}
-			// Also remove from filtered notes
 			for i, n := range s.filteredNotes {
 				if n.Identifier == noteID {
 					s.filteredNotes = append(s.filteredNotes[:i], s.filteredNotes[i+1:]...)
@@ -704,7 +695,6 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 			}
 			s.mu.Unlock()
 		case "r":
-			// Manual rename request
 			if s.callbacks.OnRename != nil {
 				s.callbacks.OnRename(noteID)
 			}
@@ -713,11 +703,7 @@ func (s *server) write(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 		return errorFcall(fc, "field is read-only")
 	}
 
-	return &plan9.Fcall{
-		Type:  plan9.Rwrite,
-		Tag:   fc.Tag,
-		Count: uint32(len(fc.Data)),
-	}
+	return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(f.writeBuf))}
 }
 
 func (s *server) stat(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
@@ -744,9 +730,17 @@ func (s *server) stat(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 
 func (s *server) clunk(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 	cs.mu.Lock()
-	defer cs.mu.Unlock()
-
+	f, ok := cs.fids[fc.Fid]
+	if ok && len(f.writeBuf) > 0 {
+		// Dispatch accumulated write before clunking
+		cs.mu.Unlock()
+		if resp := s.dispatchWrite(f, fc.Tag); resp.Type == plan9.Rerror {
+			return resp
+		}
+		cs.mu.Lock()
+	}
 	delete(cs.fids, fc.Fid)
+	cs.mu.Unlock()
 
 	return &plan9.Fcall{
 		Type: plan9.Rclunk,
