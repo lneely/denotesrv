@@ -51,6 +51,7 @@ import (
 
 	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/client"
+	ps "github.com/simonfxr/pubsub"
 )
 
 // File types in our filesystem
@@ -92,6 +93,7 @@ type server struct {
 	callbacks     Callbacks
 	filterQuery   string
 	filteredNotes []*metadata.Metadata
+	events        *ps.Bus
 }
 
 type connState struct {
@@ -100,11 +102,13 @@ type connState struct {
 }
 
 type fid struct {
-	qid      plan9.Qid
-	path     string
-	offset   int64
-	mode     uint8
-	writeBuf []byte // accumulates Twrite chunks, dispatched on Tclunk
+	qid         plan9.Qid
+	path        string
+	offset      int64
+	mode        uint8
+	writeBuf    []byte          // accumulates Twrite chunks, dispatched on Tclunk
+	eventCh     chan string     // for event subscribers
+	eventCancel func()          // unsubscribe callback
 }
 
 var srv *server
@@ -181,6 +185,7 @@ func NewServer(denoteDir string, callbacks Callbacks) (*Server, error) {
 		notes:     notes,
 		denoteDir: denoteDir,
 		callbacks: callbacks,
+		events:    ps.NewBus(),
 	}
 	return &Server{s}, nil
 }
@@ -199,6 +204,7 @@ func StartServer(initialData metadata.Results, denoteDir string, callbacks Callb
 		notes:     initialData,
 		denoteDir: denoteDir,
 		callbacks: callbacks,
+		events:    ps.NewBus(),
 	}
 
 	// Get namespace and create Unix socket path
@@ -403,6 +409,14 @@ func (s *server) walk(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 				qids = append(qids, qid)
 				path = "/dir"
 				found = true
+			} else if name == "event" {
+				qid := plan9.Qid{
+					Type: QTFile,
+					Path: uint64(qidEvent),
+				}
+				qids = append(qids, qid)
+				path = "/event"
+				found = true
 			} else if name == "n" {
 				qid := plan9.Qid{
 					Type: QTDir,
@@ -493,6 +507,24 @@ func (s *server) read(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 	if !ok {
 		cs.mu.Unlock()
 		return errorFcall(fc, "fid not found")
+	}
+
+	// Handle event stream (blocking read with pubsub)
+	if f.path == "/event" {
+		if f.eventCh == nil {
+			ch := make(chan string, 64)
+			sub := s.events.SubscribeChan("events", ch, ps.CloseOnUnsubscribe)
+			f.eventCh = ch
+			f.eventCancel = func() { s.events.Unsubscribe(sub) }
+		}
+		cs.mu.Unlock()
+		select {
+		case msg := <-f.eventCh:
+			data := []byte(msg + "\n")
+			return &plan9.Fcall{Type: plan9.Rread, Tag: fc.Tag, Count: uint32(len(data)), Data: data}
+		case <-time.After(30 * time.Second):
+			return &plan9.Fcall{Type: plan9.Rread, Tag: fc.Tag, Count: 0, Data: []byte{}}
+		}
 	}
 
 	defer cs.mu.Unlock()
@@ -622,6 +654,7 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		if s.callbacks.OnNew != nil {
 			go s.callbacks.OnNew(identifier)
 		}
+		s.events.Publish("events", "n "+identifier)
 
 		return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(f.writeBuf))}
 	}
@@ -651,6 +684,8 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		if s.callbacks.OnRename != nil {
 			s.callbacks.OnRename(noteID)
 		}
+		s.events.Publish("events", "u "+noteID)
+		s.events.Publish("events", "r "+noteID)
 	case "keywords":
 		if input == "" {
 			note.Tags = []string{}
@@ -667,6 +702,8 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		if s.callbacks.OnRename != nil {
 			s.callbacks.OnRename(noteID)
 		}
+		s.events.Publish("events", "u "+noteID)
+		s.events.Publish("events", "r "+noteID)
 	case "signature":
 		note.Signature = input
 		if s.callbacks.OnUpdate != nil {
@@ -675,12 +712,15 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		if s.callbacks.OnRename != nil {
 			s.callbacks.OnRename(noteID)
 		}
+		s.events.Publish("events", "u "+noteID)
+		s.events.Publish("events", "r "+noteID)
 	case "ctl":
 		switch input {
 		case "d":
 			if s.callbacks.OnDelete != nil {
 				s.callbacks.OnDelete(noteID)
 			}
+			s.events.Publish("events", "d "+noteID)
 			s.mu.Lock()
 			for i, n := range s.notes {
 				if n.Identifier == noteID {
@@ -699,6 +739,7 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 			if s.callbacks.OnRename != nil {
 				s.callbacks.OnRename(noteID)
 			}
+			s.events.Publish("events", "r "+noteID)
 		}
 	case "body":
 		if err := s.writeBody(note.Path, input, note); err != nil {
@@ -743,6 +784,10 @@ func (s *server) clunk(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 			return resp
 		}
 		cs.mu.Lock()
+	}
+	// Clean up event subscription if any
+	if ok && f.eventCancel != nil {
+		f.eventCancel()
 	}
 	delete(cs.fids, fc.Fid)
 	cs.mu.Unlock()
@@ -808,6 +853,19 @@ func (s *server) readDir(path string, offset int64, count uint32) []byte {
 			Gid:    "denote",
 			Muid:   "denote",
 			Length: uint64(len(s.denoteDir)),
+		})
+		// add event node
+		dirs = append(dirs, plan9.Dir{
+			Qid: plan9.Qid{
+				Type: QTFile,
+				Path: uint64(qidEvent),
+			},
+			Mode:   0444,
+			Name:   "event",
+			Uid:    "denote",
+			Gid:    "denote",
+			Muid:   "denote",
+			Length: 0,
 		})
 		// add n directory
 		dirs = append(dirs, plan9.Dir{
