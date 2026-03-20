@@ -120,10 +120,10 @@ func GetDenoteDir() string {
 }
 
 // findNote finds a note by identifier in the in-memory collection
-func findNote(identifier string) (*metadata.Metadata, error) {
-	srv.mu.RLock()
-	defer srv.mu.RUnlock()
-	for _, n := range srv.notes {
+func (s *server) findNote(identifier string) (*metadata.Metadata, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, n := range s.notes {
 		if n.Identifier == identifier {
 			return n, nil
 		}
@@ -138,7 +138,7 @@ func UpdateMetadataFromDisk(identifier, title, keywords, signature string) error
 		return fmt.Errorf("server not running")
 	}
 
-	note, err := findNote(identifier)
+	note, err := srv.findNote(identifier)
 	if err != nil {
 		return err
 	}
@@ -634,7 +634,7 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 	noteID := parts[1]
 	fieldName := parts[2]
 
-	note, err := findNote(noteID)
+	note, err := s.findNote(noteID)
 	if err != nil {
 		return errorFcall(fc, err.Error())
 	}
@@ -968,7 +968,7 @@ func (s *server) getFileContent(path string) string {
 	noteID := parts[1]
 	fileName := parts[2]
 
-	note, err := findNote(noteID)
+	note, err := s.findNote(noteID)
 	if err != nil {
 		return ""
 	}
