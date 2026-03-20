@@ -18,6 +18,8 @@ import (
 
 const serviceName = "denote"
 
+var mountPath = flag.String("mount", "", "FUSE mount path (default: $HOME/mnt/denote)")
+
 func main() {
 	flag.Parse()
 
@@ -74,7 +76,11 @@ func isRunning(sockPath string) bool {
 
 func daemonize(pidPath string) {
 	exe, _ := os.Executable()
-	cmd := exec.Command(exe, "fgstart")
+	args := []string{"fgstart"}
+	if *mountPath != "" {
+		args = append(args, "-mount", *mountPath)
+	}
+	cmd := exec.Command(exe, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	cmd.Stdin = nil
@@ -142,12 +148,34 @@ func runServer(sockPath, pidPath string) {
 
 	fmt.Printf("denotesrv listening on %s (dir: %s)\n", sockPath, denoteDir)
 
+	// Setup FUSE mount
+	mnt := *mountPath
+	if mnt == "" {
+		mnt = filepath.Join(os.Getenv("HOME"), "mnt", "denote")
+	}
+	var fuseCmd *exec.Cmd
+	if err := os.MkdirAll(mnt, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot create mount dir: %v\n", err)
+	} else {
+		fuseCmd = exec.Command("9pfuse", sockPath, mnt)
+		if err := fuseCmd.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: 9pfuse failed: %v\n", err)
+			fuseCmd = nil
+		} else {
+			fmt.Printf("mounted at %s\n", mnt)
+		}
+	}
+
 	// Wait for signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 
 	fmt.Println("shutting down")
+	if fuseCmd != nil {
+		exec.Command("fusermount", "-u", mnt).Run()
+		fuseCmd.Wait()
+	}
 	listener.Close()
 	os.Remove(sockPath)
 	os.Remove(pidPath)
