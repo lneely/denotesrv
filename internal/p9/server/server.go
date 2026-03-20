@@ -74,7 +74,7 @@ const (
 	qidDir      = 999994
 )
 
-var fileNames = []string{"path", "title", "keywords", "signature", "ctl", "backlinks"}
+var fileNames = []string{"path", "title", "keywords", "signature", "ctl", "backlinks", "body"}
 
 // Callbacks for note operations
 type Callbacks struct {
@@ -699,6 +699,10 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 				s.callbacks.OnRename(noteID)
 			}
 		}
+	case "body":
+		if err := s.writeBody(note.Path, input); err != nil {
+			return errorFcall(fc, err.Error())
+		}
 	default:
 		return errorFcall(fc, "field is read-only")
 	}
@@ -841,7 +845,7 @@ func (s *server) readDir(path string, offset int64, count uint32) []byte {
 		for i, fname := range fileNames {
 			content := s.getFileContent(path + "/" + fname)
 			mode := uint32(0444) // read-only by default
-			if fname == "title" || fname == "keywords" || fname == "path" {
+			if fname == "title" || fname == "keywords" || fname == "path" || fname == "body" {
 				mode = 0644 // writable
 			} else if fname == "ctl" {
 				mode = 0200 // write-only
@@ -984,8 +988,48 @@ func (s *server) getFileContent(path string) string {
 		return note.Signature
 	case "backlinks":
 		return s.getBacklinks(noteID)
+	case "body":
+		return s.readBody(note.Path)
 	}
 	return ""
+}
+
+// readBody reads the file at path and returns content after frontmatter
+func (s *server) readBody(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	content := string(data)
+	// Skip frontmatter (between --- markers)
+	if strings.HasPrefix(content, "---\n") {
+		if end := strings.Index(content[4:], "\n---\n"); end != -1 {
+			return content[4+end+5:]
+		}
+	}
+	return content
+}
+
+// writeBody writes content to file, preserving frontmatter
+func (s *server) writeBody(path, body string) error {
+	if path == "" {
+		return fmt.Errorf("no path")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	content := string(data)
+	var frontmatter string
+	if strings.HasPrefix(content, "---\n") {
+		if end := strings.Index(content[4:], "\n---\n"); end != -1 {
+			frontmatter = content[:4+end+5]
+		}
+	}
+	return os.WriteFile(path, []byte(frontmatter+body), 0644)
 }
 
 func errorFcall(fc *plan9.Fcall, msg string) *plan9.Fcall {
