@@ -34,6 +34,7 @@ package fs
 
 import (
 	"denotesrv/internal/disk"
+	"denotesrv/pkg/encoding/frontmatter"
 	"denotesrv/pkg/encoding/results"
 	"denotesrv/pkg/metadata"
 	"errors"
@@ -700,7 +701,7 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 			}
 		}
 	case "body":
-		if err := s.writeBody(note.Path, input); err != nil {
+		if err := s.writeBody(note.Path, input, note); err != nil {
 			return errorFcall(fc, err.Error())
 		}
 	default:
@@ -1006,12 +1007,23 @@ func (s *server) readBody(path string) string {
 	return string(data)
 }
 
-// writeBody writes content to file
-func (s *server) writeBody(path, body string) error {
+// writeBody writes content to file and syncs frontmatter to metadata
+func (s *server) writeBody(path, body string, note *metadata.Metadata) error {
 	if path == "" {
 		return fmt.Errorf("no path")
 	}
-	return os.WriteFile(path, []byte(body), 0644)
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		return err
+	}
+	// Parse frontmatter and sync to metadata
+	ext := filepath.Ext(path)
+	fm, _, _ := frontmatter.Unmarshal([]byte(body), ext)
+	if fm != nil && fm.Title != "" {
+		note.Title = fm.Title
+		note.Tags = fm.Tags
+		note.Signature = fm.Signature
+	}
+	return nil
 }
 
 func errorFcall(fc *plan9.Fcall, msg string) *plan9.Fcall {
@@ -1035,7 +1047,36 @@ func (s *server) handleCtlCommand(fc *plan9.Fcall) *plan9.Fcall {
 		return s.handleCdCommand(fc, command)
 	}
 
+	if command == "refresh" {
+		return s.handleRefreshCommand(fc)
+	}
+
 	return errorFcall(fc, fmt.Sprintf("unknown ctl command: %s", command))
+}
+
+// handleRefreshCommand reloads metadata from disk for all notes
+func (s *server) handleRefreshCommand(fc *plan9.Fcall) *plan9.Fcall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, note := range s.notes {
+		if note.Path == "" {
+			continue
+		}
+		data, err := os.ReadFile(note.Path)
+		if err != nil {
+			continue
+		}
+		ext := filepath.Ext(note.Path)
+		fm, _, _ := frontmatter.Unmarshal(data, ext)
+		if fm != nil && fm.Title != "" {
+			note.Title = fm.Title
+			note.Tags = fm.Tags
+			note.Signature = fm.Signature
+		}
+	}
+
+	return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(fc.Data))}
 }
 
 // handleFilterCommand processes the 'filter' ctl command
