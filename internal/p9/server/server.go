@@ -931,17 +931,27 @@ func (s *server) readDir(path string, offset int64, count uint32) []byte {
 		allData = append(allData, stat...)
 	}
 
-	// Return slice starting from offset
+	// Return only complete entries starting at offset.
+	// 9P requires that directory reads never split an entry across reads.
 	if offset >= int64(len(allData)) {
 		return []byte{}
 	}
 
-	end := offset + int64(count)
-	if end > int64(len(allData)) {
-		end = int64(len(allData))
+	remaining := allData[offset:]
+	var result []byte
+	for len(remaining) >= 2 {
+		entrySize := int(remaining[0]) | int(remaining[1])<<8
+		totalSize := entrySize + 2
+		if len(remaining) < totalSize {
+			break
+		}
+		if len(result)+totalSize > int(count) {
+			break
+		}
+		result = append(result, remaining[:totalSize]...)
+		remaining = remaining[totalSize:]
 	}
-
-	return allData[offset:end]
+	return result
 }
 
 func (s *server) pathToDir(path string, qid plan9.Qid) plan9.Dir {

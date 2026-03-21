@@ -165,7 +165,8 @@ func LoadAll(dir string) (metadata.Results, error) {
 
 		note, err := ExtractMetadata(path)
 		if err != nil {
-			return err
+			log.Printf("warning: skipping %s: %v", path, err)
+			return nil
 		}
 
 		// Only include files with valid identifiers
