@@ -155,7 +155,7 @@ func TestUnmarshal(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := Unmarshal(tt.input)
+			got, err := UnmarshalStrict(tt.input)
 
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Unmarshal() error = %v, wantErr %v", err, tt.wantErr)

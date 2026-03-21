@@ -54,9 +54,13 @@ func formatTags(tags []string, fileType metadata.FileType) string {
 	case metadata.FileTypeOrg:
 		return ":" + strings.Join(tags, ":") + ":"
 	case metadata.FileTypeMdYaml, metadata.FileTypeMdToml:
-		return "[" + strings.Join(tags, ", ") + "]"
+		quoted := make([]string, len(tags))
+		for i, t := range tags {
+			quoted[i] = `"` + t + `"`
+		}
+		return "[" + strings.Join(quoted, ", ") + "]"
 	default:
-		return strings.Join(tags, " ")
+		return strings.Join(tags, "  ")
 	}
 }
 
@@ -75,6 +79,28 @@ func Marshal(fm *metadata.FrontMatter, fileType metadata.FileType) []byte {
 	return []byte(content)
 }
 
+var tagSplitRe = regexp.MustCompile(`[\s,;:]+`)
+var tagStripRe = regexp.MustCompile(`[^a-z0-9]`)
+
+// parseTags parses a raw tag string into normalized tags.
+// Accepts any delimiter format: "[tag1, tag2]", "tag1 tag2", ":tag1:tag2:".
+// Normalizes each tag to [a-z0-9]+, dropping empty results.
+func parseTags(s string) []string {
+	s = strings.Trim(s, "[] \t")
+	if s == "" {
+		return nil
+	}
+	parts := tagSplitRe.Split(s, -1)
+	var tags []string
+	for _, p := range parts {
+		p = tagStripRe.ReplaceAllString(strings.ToLower(p), "")
+		if p != "" {
+			tags = append(tags, p)
+		}
+	}
+	return tags
+}
+
 // Unmarshal extracts front matter from file content.
 // ext should be the file extension (e.g., ".md", ".org", ".txt").
 // Returns the parsed frontmatter and the detected FileType.
@@ -91,8 +117,8 @@ func Unmarshal(content []byte, ext string) (*metadata.FrontMatter, metadata.File
 		if m := regexp.MustCompile(`(?m)^#\+title:[ \t]*(.+)$`).FindStringSubmatch(text); m != nil {
 			fm.Title = strings.TrimSpace(m[1])
 		}
-		if m := regexp.MustCompile(`(?m)^#\+filetags:[ \t]*:(.+):$`).FindStringSubmatch(text); m != nil {
-			fm.Tags = strings.Split(m[1], ":")
+		if m := regexp.MustCompile(`(?m)^#\+filetags:[ \t]*(.+)$`).FindStringSubmatch(text); m != nil {
+			fm.Tags = parseTags(m[1])
 		}
 		if m := regexp.MustCompile(`(?m)^#\+identifier:[ \t]*(.+)$`).FindStringSubmatch(text); m != nil {
 			fm.Identifier = strings.TrimSpace(m[1])
@@ -110,14 +136,8 @@ func Unmarshal(content []byte, ext string) (*metadata.FrontMatter, metadata.File
 			if m := regexp.MustCompile(`(?m)^title:[ \t]*["']?(.+?)["']?$`).FindStringSubmatch(yamlContent); m != nil {
 				fm.Title = strings.TrimSpace(m[1])
 			}
-			if m := regexp.MustCompile(`(?m)^tags:[ \t]*\[(.+?)\]$`).FindStringSubmatch(yamlContent); m != nil {
-				tags := strings.Split(m[1], ",")
-				for i, t := range tags {
-					t = strings.TrimSpace(t)
-					t = strings.Trim(t, `"'`)
-					tags[i] = t
-				}
-				fm.Tags = tags
+			if m := regexp.MustCompile(`(?m)^tags:[ \t]*(.+)$`).FindStringSubmatch(yamlContent); m != nil {
+				fm.Tags = parseTags(m[1])
 			}
 			if m := regexp.MustCompile(`(?m)^identifier:[ \t]*["']?(.+?)["']?$`).FindStringSubmatch(yamlContent); m != nil {
 				fm.Identifier = strings.TrimSpace(m[1])
@@ -134,14 +154,8 @@ func Unmarshal(content []byte, ext string) (*metadata.FrontMatter, metadata.File
 				if m := regexp.MustCompile(`(?m)^title[ \t]*=[ \t]*["']?(.+?)["']?$`).FindStringSubmatch(tomlContent); m != nil {
 					fm.Title = strings.TrimSpace(m[1])
 				}
-				if m := regexp.MustCompile(`(?m)^tags[ \t]*=[ \t]*\[(.+?)\]$`).FindStringSubmatch(tomlContent); m != nil {
-					tags := strings.Split(m[1], ",")
-					for i, t := range tags {
-						t = strings.TrimSpace(t)
-						t = strings.Trim(t, `"'`)
-						tags[i] = t
-					}
-					fm.Tags = tags
+				if m := regexp.MustCompile(`(?m)^tags[ \t]*=[ \t]*(.+)$`).FindStringSubmatch(tomlContent); m != nil {
+					fm.Tags = parseTags(m[1])
 				}
 				if m := regexp.MustCompile(`(?m)^identifier[ \t]*=[ \t]*["']?(.+?)["']?$`).FindStringSubmatch(tomlContent); m != nil {
 					fm.Identifier = strings.TrimSpace(m[1])
@@ -158,7 +172,7 @@ func Unmarshal(content []byte, ext string) (*metadata.FrontMatter, metadata.File
 			fm.Title = strings.TrimSpace(m[1])
 		}
 		if m := regexp.MustCompile(`(?m)^tags:[ \t]*(.+)$`).FindStringSubmatch(text); m != nil {
-			fm.Tags = strings.Fields(m[1])
+			fm.Tags = parseTags(m[1])
 		}
 		if m := regexp.MustCompile(`(?m)^identifier:[ \t]*(.+)$`).FindStringSubmatch(text); m != nil {
 			fm.Identifier = strings.TrimSpace(m[1])

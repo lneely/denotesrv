@@ -38,13 +38,13 @@ func TestFormatTags(t *testing.T) {
 			name:     "md-yaml with multiple tags",
 			tags:     []string{"tag1", "tag2"},
 			fileType: metadata.FileTypeMdYaml,
-			want:     "[tag1, tag2]",
+			want:     `["tag1", "tag2"]`,
 		},
 		{
 			name:     "md-yaml with single tag",
 			tags:     []string{"single"},
 			fileType: metadata.FileTypeMdYaml,
-			want:     "[single]",
+			want:     `["single"]`,
 		},
 		{
 			name:     "md-yaml with empty tags",
@@ -56,7 +56,7 @@ func TestFormatTags(t *testing.T) {
 			name:     "md-toml with multiple tags",
 			tags:     []string{"tag1", "tag2"},
 			fileType: metadata.FileTypeMdToml,
-			want:     "[tag1, tag2]",
+			want:     `["tag1", "tag2"]`,
 		},
 		{
 			name:     "md-toml with empty tags",
@@ -68,7 +68,7 @@ func TestFormatTags(t *testing.T) {
 			name:     "txt with multiple tags",
 			tags:     []string{"tag1", "tag2"},
 			fileType: metadata.FileTypeTxt,
-			want:     "tag1 tag2",
+			want:     "tag1  tag2",
 		},
 		{
 			name:     "txt with single tag",
@@ -123,7 +123,7 @@ func TestFrontMatterBytes(t *testing.T) {
 			wantContains: []string{
 				"---",
 				"title:      Test Note",
-				"tags:       [tag1, tag2]",
+				`tags:       ["tag1", "tag2"]`,
 				"identifier: 20240101T120000",
 				"date:",
 			},
@@ -134,7 +134,7 @@ func TestFrontMatterBytes(t *testing.T) {
 			wantContains: []string{
 				"+++",
 				"title      = Test Note",
-				"tags       = [tag1, tag2]",
+				`tags       = ["tag1", "tag2"]`,
 				"identifier = 20240101T120000",
 				"date       =",
 			},
@@ -144,7 +144,7 @@ func TestFrontMatterBytes(t *testing.T) {
 			fileType: metadata.FileTypeTxt,
 			wantContains: []string{
 				"title:      Test Note",
-				"tags:       tag1 tag2",
+				"tags:       tag1  tag2",
 				"identifier: 20240101T120000",
 				"date:",
 				"---------------------------",
