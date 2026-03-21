@@ -650,6 +650,9 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		if s.callbacks.OnRename != nil {
 			s.callbacks.OnRename(noteID)
 		}
+		if err := s.updateFrontMatter(note); err != nil {
+			return errorFcall(fc, err.Error())
+		}
 		if err := s.renameNote(note); err != nil {
 			return errorFcall(fc, err.Error())
 		}
@@ -669,6 +672,9 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		if s.callbacks.OnRename != nil {
 			s.callbacks.OnRename(noteID)
 		}
+		if err := s.updateFrontMatter(note); err != nil {
+			return errorFcall(fc, err.Error())
+		}
 		if err := s.renameNote(note); err != nil {
 			return errorFcall(fc, err.Error())
 		}
@@ -679,6 +685,9 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		}
 		if s.callbacks.OnRename != nil {
 			s.callbacks.OnRename(noteID)
+		}
+		if err := s.updateFrontMatter(note); err != nil {
+			return errorFcall(fc, err.Error())
 		}
 		if err := s.renameNote(note); err != nil {
 			return errorFcall(fc, err.Error())
@@ -1008,25 +1017,53 @@ func (s *server) getFileContent(path string) string {
 	case "backlinks":
 		return s.getBacklinks(noteID)
 	case "body":
-		return s.readBody(note.Path)
+		return s.readBody(note)
 	}
 	return ""
 }
 
-// readBody reads the file content at path
-func (s *server) readBody(path string) string {
-	if path == "" {
+// readBody reads the file content, normalizing frontmatter tags if needed.
+// Malformed tags are fixed in place and the file is renamed if necessary.
+func (s *server) readBody(note *metadata.Metadata) string {
+	if note.Path == "" {
 		return ""
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(note.Path)
 	if err != nil {
 		return ""
+	}
+	ext := filepath.Ext(note.Path)
+	fm, fileType, _ := frontmatter.Unmarshal(data, ext)
+	if fm != nil && fm.Title != "" {
+		note.Title = fm.Title
+		note.Tags = fm.Tags
+		note.Signature = fm.Signature
+		normalized := frontmatter.NormalizeTags(data, fm.Tags, fileType)
+		if string(normalized) != string(data) {
+			if err := os.WriteFile(note.Path, normalized, 0644); err == nil {
+				data = normalized
+			}
+		}
+		// Rename if tags changed the filename
+		s.renameNote(note) //nolint:errcheck
 	}
 	return string(data)
 }
 
 // renameNote renames the physical file to match current note metadata and updates note.Path.
 // It is a no-op when the filename is already correct.
+func (s *server) updateFrontMatter(note *metadata.Metadata) error {
+	if note.Path == "" || !disk.SupportsFrontMatter(note.Path) {
+		return nil
+	}
+	_, fileType, err := disk.ExtractFrontMatter(note.Path)
+	if err != nil {
+		return err
+	}
+	fm := metadata.NewFrontMatter(note.Title, note.Signature, note.Tags, note.Identifier)
+	return disk.UpdateFrontMatter(note.Path, fm, fileType)
+}
+
 func (s *server) renameNote(note *metadata.Metadata) error {
 	if note.Path == "" {
 		return nil
@@ -1045,7 +1082,8 @@ func (s *server) renameNote(note *metadata.Metadata) error {
 	return nil
 }
 
-// writeBody writes content to file and syncs frontmatter to metadata
+// writeBody writes content to file and syncs frontmatter to metadata.
+// If frontmatter tags are malformed, they are normalized and written back.
 func (s *server) writeBody(path, body string, note *metadata.Metadata) error {
 	if path == "" {
 		return fmt.Errorf("no path")
@@ -1055,11 +1093,18 @@ func (s *server) writeBody(path, body string, note *metadata.Metadata) error {
 	}
 	// Parse frontmatter and sync to metadata
 	ext := filepath.Ext(path)
-	fm, _, _ := frontmatter.Unmarshal([]byte(body), ext)
+	fm, fileType, _ := frontmatter.Unmarshal([]byte(body), ext)
 	if fm != nil && fm.Title != "" {
 		note.Title = fm.Title
 		note.Tags = fm.Tags
 		note.Signature = fm.Signature
+		// Write normalized tags back into the file
+		normalized := frontmatter.NormalizeTags([]byte(body), fm.Tags, fileType)
+		if string(normalized) != body {
+			if err := os.WriteFile(path, normalized, 0644); err != nil {
+				return err
+			}
+		}
 	}
 	return s.renameNote(note)
 }

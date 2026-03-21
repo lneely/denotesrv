@@ -79,7 +79,13 @@ func Marshal(fm *metadata.FrontMatter, fileType metadata.FileType) []byte {
 	return []byte(content)
 }
 
-var tagSplitRe = regexp.MustCompile(`[\s,;:]+`)
+var (
+	tagSplitRe    = regexp.MustCompile(`[\s,;:]+`)
+	orgFiletagsRe = regexp.MustCompile(`(?m)^(#\+filetags:[ \t]*).*$`)
+	mdYamlTagsRe  = regexp.MustCompile(`(?m)^(tags:[ \t]*).*$`)
+	mdTomlTagsRe  = regexp.MustCompile(`(?m)^(tags[ \t]*=[ \t]*).*$`)
+	txtTagsRe     = regexp.MustCompile(`(?m)^(tags:[ \t]*).*$`)
+)
 var tagStripRe = regexp.MustCompile(`[^a-z0-9]`)
 
 // parseTags parses a raw tag string into normalized tags.
@@ -99,6 +105,33 @@ func parseTags(s string) []string {
 		}
 	}
 	return tags
+}
+
+// NormalizeTags replaces the tags field in content with the normalized,
+// correctly formatted version for the given file type.
+// Returns the updated content. If no tags field is found, content is unchanged.
+func NormalizeTags(content []byte, tags []string, fileType metadata.FileType) []byte {
+	formatted := formatTags(tags, fileType)
+	text := string(content)
+	switch fileType {
+	case metadata.FileTypeOrg:
+		text = orgFiletagsRe.ReplaceAllString(text, "${1}"+formatted)
+	case metadata.FileTypeMdYaml:
+		// Only replace within the --- block
+		yamlRe := regexp.MustCompile(`(?ms)^---\n(.*?)\n---`)
+		text = yamlRe.ReplaceAllStringFunc(text, func(block string) string {
+			return mdYamlTagsRe.ReplaceAllString(block, "${1}"+formatted)
+		})
+	case metadata.FileTypeMdToml:
+		// Only replace within the +++ block
+		tomlRe := regexp.MustCompile(`(?ms)^\+\+\+\n(.*?)\n\+\+\+`)
+		text = tomlRe.ReplaceAllStringFunc(text, func(block string) string {
+			return mdTomlTagsRe.ReplaceAllString(block, "${1}"+formatted)
+		})
+	case metadata.FileTypeTxt:
+		text = txtTagsRe.ReplaceAllString(text, "${1}"+formatted)
+	}
+	return []byte(text)
 }
 
 // Unmarshal extracts front matter from file content.
