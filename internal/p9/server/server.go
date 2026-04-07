@@ -605,15 +605,17 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 			}
 		}
 
-		identifier := time.Now().Format("20060102T150405")
+identifier := time.Now().Format("20060102T150405")
+		fm := metadata.NewFrontMatter(title, signature, tags, identifier)
+		fileName := metadata.BuildFilename(fm, ".md")
+		path := filepath.Join(s.denoteDir, fileName)
 		meta := &metadata.Metadata{
 			Identifier: identifier,
 			Signature:  signature,
 			Title:      title,
 			Tags:       tags,
-			Path:       "",
+			Path:       path,
 		}
-
 		s.mu.Lock()
 		s.notes = append(s.notes, meta)
 		s.mu.Unlock()
@@ -624,7 +626,6 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 
 		return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(f.writeBuf))}
 	}
-
 	// Extract note identifier and field name from path
 	parts := strings.Split(strings.Trim(f.path, "/"), "/")
 	if len(parts) != 3 || parts[0] != "n" {
