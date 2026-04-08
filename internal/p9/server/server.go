@@ -566,7 +566,7 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 
 	// Handle writes to /new
 	if f.path == "/new" {
-		// Parse: 'Title' ==signature tag1,tag2,...
+		// Parse: 'Title' ==signature tag1,tag2 @subdir
 		if !strings.HasPrefix(input, "'") {
 			return errorFcall(fc, "title must be single-quoted")
 		}
@@ -584,19 +584,27 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		remainder := strings.TrimSpace(input[closeQuote+2:])
 		var signature string
 		var tags []string
+		var subdir string
 
 		if remainder != "" {
 			if strings.HasPrefix(remainder, "==") {
 				spaceIdx := strings.Index(remainder, " ")
 				if spaceIdx == -1 {
 					signature = remainder[2:]
+					remainder = ""
 				} else {
 					signature = remainder[2:spaceIdx]
 					remainder = strings.TrimSpace(remainder[spaceIdx+1:])
 				}
 			}
 
-			if remainder != "" && !strings.HasPrefix(remainder, "==") {
+			// Extract @subdir if present
+			if atIdx := strings.LastIndex(remainder, "@"); atIdx != -1 {
+				subdir = strings.TrimSpace(remainder[atIdx+1:])
+				remainder = strings.TrimSpace(remainder[:atIdx])
+			}
+
+			if remainder != "" {
 				tagPattern := regexp.MustCompile(`^([\p{Ll}\p{Nd}]+,)*[\p{Ll}\p{Nd}]+$`)
 				if !tagPattern.MatchString(remainder) {
 					return errorFcall(fc, "tags must be comma-delimited lowercase unicode words (no spaces)")
@@ -605,10 +613,10 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 			}
 		}
 
-identifier := time.Now().Format("20060102T150405")
+		identifier := time.Now().Format("20060102T150405")
 		fm := metadata.NewFrontMatter(title, signature, tags, identifier)
 		fileName := metadata.BuildFilename(fm, ".md")
-		path := filepath.Join(s.denoteDir, fileName)
+		path := filepath.Join(s.denoteDir, subdir, fileName)
 		meta := &metadata.Metadata{
 			Identifier: identifier,
 			Signature:  signature,
