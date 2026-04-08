@@ -616,7 +616,17 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		identifier := time.Now().Format("20060102T150405")
 		fm := metadata.NewFrontMatter(title, signature, tags, identifier)
 		fileName := metadata.BuildFilename(fm, ".md")
-		path := filepath.Join(s.denoteDir, subdir, fileName)
+		dir := filepath.Join(s.denoteDir, subdir)
+		path := filepath.Join(dir, fileName)
+
+		// Ensure directory exists and write initial frontmatter to disk
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return errorFcall(fc, fmt.Sprintf("failed to create directory: %v", err))
+		}
+		if err := os.WriteFile(path, frontmatter.Marshal(fm, metadata.FileTypeMdYaml), 0644); err != nil {
+			return errorFcall(fc, fmt.Sprintf("failed to write file: %v", err))
+		}
+
 		meta := &metadata.Metadata{
 			Identifier: identifier,
 			Signature:  signature,
