@@ -1025,13 +1025,16 @@ func (s *server) getFileContent(path string) string {
 
 // readBody reads the file content, normalizing frontmatter tags if needed.
 // Malformed tags are fixed in place and the file is renamed if necessary.
+// For new files not yet on disk, generates frontmatter from metadata.
 func (s *server) readBody(note *metadata.Metadata) string {
 	if note.Path == "" {
 		return ""
 	}
 	data, err := os.ReadFile(note.Path)
 	if err != nil {
-		return ""
+		// File doesn't exist yet - generate frontmatter from metadata
+		fm := metadata.NewFrontMatter(note.Title, note.Signature, note.Tags, note.Identifier)
+		return string(frontmatter.Marshal(fm, metadata.FileTypeMdYaml))
 	}
 	ext := filepath.Ext(note.Path)
 	fm, fileType, _ := frontmatter.Unmarshal(data, ext)
