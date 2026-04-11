@@ -7,7 +7,7 @@ follows:
 		ctl					(write-only) Control file (commands: filter <query>, cd <path>)
 		event				(read-only)  Global event bus (listen & react to rename, update, and delete events)
 		index				(read-only)  Metadata index (respects active filter)
-		new					(write-only) Create new note (write "'title' tag1,tag2")
+		new					(read-write) Create new note; read for a YAML frontmatter template, then write the filled-in template (with optional body) to create a note
 		n/					(directory)  Notes directory
 			<identifier>/   (directory)  Unique denote file identifier
 				backlinks	(read-only)  Notes that link to this note (same format as index)
@@ -28,7 +28,7 @@ Notes:
 - Messages written to denote/n/<identifier>/ctl may generate events that are broadcast over the global event bus
 - Writing to title or keywords triggers an update ('u') event and a rename ('r') event
 - Write 'd' to denote/n/<identifier>/ctl to delete a denote file
-- Write "'document title' tag1,tag2,(...)" to denote/new to create a new denote file
+- Read denote/new for a YAML frontmatter template; fill in title/tags/signature/body and write back to create a note
 */
 package fs
 
@@ -43,7 +43,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -51,6 +50,7 @@ import (
 
 	"9fans.net/go/plan9"
 	"9fans.net/go/plan9/client"
+	"gopkg.in/yaml.v3"
 )
 
 // File types in our filesystem
@@ -564,84 +564,12 @@ func (s *server) dispatchWrite(f *fid, tag uint16) *plan9.Fcall {
 		return s.handleCtlCommand(fc)
 	}
 
-	// Handle writes to /new
+	// Handle writes to /new — frontmatter template format (same pattern as 9beads new).
+	// Read /new to get the template; fill in title/tags/signature and optional body, then write back.
 	if f.path == "/new" {
-		// Parse: 'Title' ==signature tag1,tag2 @subdir
-		if !strings.HasPrefix(input, "'") {
-			return errorFcall(fc, "title must be single-quoted")
+		if err := s.handleNewWrite(f.writeBuf); err != nil {
+			return errorFcall(fc, err.Error())
 		}
-
-		closeQuote := strings.Index(input[1:], "'")
-		if closeQuote == -1 {
-			return errorFcall(fc, "title must be single-quoted (missing closing quote)")
-		}
-
-		title := input[1 : closeQuote+1]
-		if title == "" {
-			return errorFcall(fc, "title cannot be empty")
-		}
-
-		remainder := strings.TrimSpace(input[closeQuote+2:])
-		var signature string
-		var tags []string
-		var subdir string
-
-		if remainder != "" {
-			if strings.HasPrefix(remainder, "==") {
-				spaceIdx := strings.Index(remainder, " ")
-				if spaceIdx == -1 {
-					signature = remainder[2:]
-					remainder = ""
-				} else {
-					signature = remainder[2:spaceIdx]
-					remainder = strings.TrimSpace(remainder[spaceIdx+1:])
-				}
-			}
-
-			// Extract @subdir if present
-			if atIdx := strings.LastIndex(remainder, "@"); atIdx != -1 {
-				subdir = strings.TrimSpace(remainder[atIdx+1:])
-				remainder = strings.TrimSpace(remainder[:atIdx])
-			}
-
-			if remainder != "" {
-				tagPattern := regexp.MustCompile(`^([\p{Ll}\p{Nd}]+,)*[\p{Ll}\p{Nd}]+$`)
-				if !tagPattern.MatchString(remainder) {
-					return errorFcall(fc, "tags must be comma-delimited lowercase unicode words (no spaces)")
-				}
-				tags = strings.Split(remainder, ",")
-			}
-		}
-
-		identifier := time.Now().Format("20060102T150405")
-		fm := metadata.NewFrontMatter(title, signature, tags, identifier)
-		fileName := metadata.BuildFilename(fm, ".md")
-		dir := filepath.Join(s.denoteDir, subdir)
-		path := filepath.Join(dir, fileName)
-
-		// Ensure directory exists and write initial frontmatter to disk
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return errorFcall(fc, fmt.Sprintf("failed to create directory: %v", err))
-		}
-		if err := os.WriteFile(path, frontmatter.Marshal(fm, metadata.FileTypeMdYaml), 0644); err != nil {
-			return errorFcall(fc, fmt.Sprintf("failed to write file: %v", err))
-		}
-
-		meta := &metadata.Metadata{
-			Identifier: identifier,
-			Signature:  signature,
-			Title:      title,
-			Tags:       tags,
-			Path:       path,
-		}
-		s.mu.Lock()
-		s.notes = append(s.notes, meta)
-		s.mu.Unlock()
-
-		if s.callbacks.OnNew != nil {
-			go s.callbacks.OnNew(identifier)
-		}
-
 		return &plan9.Fcall{Type: plan9.Rwrite, Tag: fc.Tag, Count: uint32(len(f.writeBuf))}
 	}
 	// Extract note identifier and field name from path
@@ -812,7 +740,7 @@ func (s *server) readDir(path string, offset int64, count uint32) []byte {
 				Type: QTFile,
 				Path: uint64(qidNew),
 			},
-			Mode:   0222,
+			Mode:   0666,
 			Name:   "new",
 			Uid:    "denote",
 			Gid:    "denote",
@@ -1009,6 +937,10 @@ func (s *server) getFileContent(path string) string {
 
 	if path == "/dir" {
 		return s.denoteDir
+	}
+
+	if path == "/new" {
+		return string(s.readNewTemplate())
 	}
 
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -1371,4 +1303,106 @@ func splitRespectingQuotes(s string) []string {
 	}
 
 	return result
+}
+
+// newNoteTemplate is the schema for a new note. Field order and yaml tags define
+// the template structure; readNewTemplate builds the actual YAML output from this.
+type newNoteTemplate struct {
+	Title      string   `yaml:"title"`
+	Date       string   `yaml:"date"`
+	Tags       []string `yaml:"tags,flow"`
+	Identifier string   `yaml:"identifier"`
+	Signature  string   `yaml:"signature"`
+}
+
+// readNewTemplate returns a YAML frontmatter template for creating a new note.
+// The client reads /new, fills in the fields, then writes back to create the note.
+// date and identifier are pre-filled; title and signature are bare-empty (not "").
+func (s *server) readNewTemplate() []byte {
+	now := time.Now()
+
+	// bare returns a plain empty scalar — YAML null, reads back as "" for string fields.
+	bare := func() *yaml.Node {
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!null", Value: ""}
+	}
+	str := func(v string) *yaml.Node {
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+	}
+	key := func(k string) *yaml.Node {
+		return &yaml.Node{Kind: yaml.ScalarNode, Value: k}
+	}
+
+	// Field order matches newNoteTemplate.
+	doc := &yaml.Node{
+		Kind: yaml.DocumentNode,
+		Content: []*yaml.Node{{
+			Kind: yaml.MappingNode,
+			Tag:  "!!map",
+			Content: []*yaml.Node{
+				key("title"), bare(),
+				key("date"), str(now.Format("2006-01-02 Mon 15:04")),
+				key("tags"), {Kind: yaml.SequenceNode, Tag: "!!seq", Style: yaml.FlowStyle},
+				key("identifier"), str(now.Format("20060102T150405")),
+				key("signature"), bare(),
+			},
+		}},
+	}
+
+	fmBytes, _ := yaml.Marshal(doc)
+	var b strings.Builder
+	b.WriteString("---\n")
+	b.Write(fmBytes)
+	b.WriteString("---\n")
+	return []byte(b.String())
+}
+
+// handleNewWrite parses a YAML frontmatter payload (optionally followed by a body)
+// written to /new, creates the note file on disk, and registers it in memory.
+func (s *server) handleNewWrite(data []byte) error {
+	parsed, _, err := frontmatter.Unmarshal(data, ".md")
+	if err != nil {
+		return fmt.Errorf("new: parse frontmatter: %w", err)
+	}
+	if parsed == nil || parsed.Title == "" {
+		return fmt.Errorf("new: title is required")
+	}
+
+	identifier := time.Now().Format("20060102T150405")
+	fm := metadata.NewFrontMatter(parsed.Title, parsed.Signature, parsed.Tags, identifier)
+	fileName := metadata.BuildFilename(fm, ".md")
+	path := filepath.Join(s.denoteDir, fileName)
+
+	// Build full file content: regenerated frontmatter + body from the write payload.
+	header := frontmatter.Marshal(fm, metadata.FileTypeMdYaml)
+	body := ""
+	if idx := strings.Index(string(data), "\n---\n"); idx >= 0 {
+		body = strings.TrimRight(string(data)[idx+5:], "\n")
+	}
+	fileContent := string(header)
+	if body != "" {
+		fileContent += body + "\n"
+	}
+
+	if err := os.MkdirAll(s.denoteDir, 0700); err != nil {
+		return fmt.Errorf("new: mkdir: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(fileContent), 0600); err != nil {
+		return fmt.Errorf("new: write: %w", err)
+	}
+
+	meta := &metadata.Metadata{
+		Identifier: identifier,
+		Signature:  parsed.Signature,
+		Title:      parsed.Title,
+		Tags:       parsed.Tags,
+		Path:       path,
+	}
+	s.mu.Lock()
+	s.notes = append(s.notes, meta)
+	s.mu.Unlock()
+
+	if s.callbacks.OnNew != nil {
+		go s.callbacks.OnNew(identifier)
+	}
+	return nil
 }
