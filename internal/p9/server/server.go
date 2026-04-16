@@ -6,9 +6,9 @@ follows:
 	denote/                 (directory)  Root filesystem
 		ctl					(write-only) Control file (commands: filter <query>, cd <path>)
 		event				(read-only)  Global event bus (listen & react to rename, update, and delete events)
-		index				(read-only)  Metadata index (respects active filter)
 		new					(read-write) Create new note; read for a YAML frontmatter template, then write the filled-in template (with optional body) to create a note
 		n/					(directory)  Notes directory
+			idx				(read-only)  Metadata index (respects active filter)
 			<identifier>/   (directory)  Unique denote file identifier
 				backlinks	(read-only)  Notes that link to this note (same format as index)
 				ctl			(write-only) Control file (publish rename, update, and delete events)
@@ -22,7 +22,7 @@ Notes:
 - Multiple filters can be specified: filter tag:journal !tag:draft
 - Titles with spaces must be quoted: filter title:"My Title"
 - Writing 'filter' with no arguments clears the active filter
-- Index respects the current filter - returns only matching notes
+- n/idx respects the current filter - returns only matching notes
 - Cd command syntax: cd /path/to/directory
 - After cd, run Get to reload notes from the new directory
 - Messages written to denote/n/<identifier>/ctl may generate events that are broadcast over the global event bus
@@ -67,11 +67,11 @@ const (
 	qidRoot     = 0
 	qidNoteBase = 1
 	qidFileBase = 1000001
-	qidIndex    = 999999
 	qidNew      = 999997
 	qidNDir     = 999996
 	qidCtl      = 999995
 	qidDir      = 999994
+	qidNIdx     = 999993
 )
 
 var fileNames = []string{"path", "title", "keywords", "signature", "ctl", "backlinks", "body"}
@@ -370,15 +370,7 @@ func (s *server) walk(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 		if path == "/" {
 			// Walking from root
 			found := false
-			if name == "index" {
-				qid := plan9.Qid{
-					Type: QTFile,
-					Path: uint64(qidIndex),
-				}
-				qids = append(qids, qid)
-				path = "/index"
-				found = true
-			} else if name == "new" {
+			if name == "new" {
 				qid := plan9.Qid{
 					Type: QTFile,
 					Path: uint64(qidNew),
@@ -415,8 +407,14 @@ func (s *server) walk(cs *connState, fc *plan9.Fcall) *plan9.Fcall {
 				return errorFcall(fc, "file not found")
 			}
 		} else if path == "/n" {
-			// Walking from /n - should be a note identifier
+			// Walking from /n - idx or a note identifier
 			found := false
+			if name == "idx" {
+				qid := plan9.Qid{Type: QTFile, Path: uint64(qidNIdx)}
+				qids = append(qids, qid)
+				path = "/n/idx"
+				found = true
+			}
 			for i, note := range s.notes {
 				if note.Identifier == name {
 					qid := plan9.Qid{
@@ -721,19 +719,6 @@ func (s *server) readDir(path string, offset int64, count uint32) []byte {
 	var dirs []plan9.Dir
 
 	if path == "/" {
-		// add index node
-		dirs = append(dirs, plan9.Dir{
-			Qid: plan9.Qid{
-				Type: QTFile,
-				Path: uint64(qidIndex),
-			},
-			Mode:   0444,
-			Name:   "index",
-			Uid:    "denote",
-			Gid:    "denote",
-			Muid:   "denote",
-			Length: 0,
-		})
 		// add new node
 		dirs = append(dirs, plan9.Dir{
 			Qid: plan9.Qid{
@@ -786,10 +771,11 @@ func (s *server) readDir(path string, offset int64, count uint32) []byte {
 			Muid:   "denote",
 			Length: 0,
 		})
-	} else if path == "/index" {
-
 	} else if path == "/n" {
-		// List all note IDs
+		dirs = append(dirs, plan9.Dir{
+			Qid:  plan9.Qid{Type: QTFile, Path: uint64(qidNIdx)},
+			Mode: 0444, Name: "idx", Uid: "denote", Gid: "denote", Muid: "denote",
+		})
 		for i, note := range s.notes {
 			dirs = append(dirs, plan9.Dir{
 				Qid: plan9.Qid{
@@ -931,16 +917,16 @@ func (s *server) getBacklinks(targetID string) string {
 }
 
 func (s *server) getFileContent(path string) string {
-	if path == "/index" {
-		return s.getIndexContent()
-	}
-
 	if path == "/dir" {
 		return s.denoteDir
 	}
 
 	if path == "/new" {
 		return string(s.readNewTemplate())
+	}
+
+	if path == "/n/idx" {
+		return s.getIndexContent()
 	}
 
 	parts := strings.Split(strings.Trim(path, "/"), "/")
